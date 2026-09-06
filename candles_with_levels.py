@@ -78,7 +78,9 @@ def _zone_key(z):
 
 def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
                              validated_zones=None, title="Price with key levels",
-                             show_vwap=True, x_range=None, height=500, compact=False):
+                             show_vwap=True, x_range=None, height=500, compact=False,
+                             tick_format=None, y_range=None, market_hours_breaks=False,
+                             event_markers=None):
     """
     df: OHLC(V) dataframe with columns ['timestamp','open','high','low','close']
         and ideally 'volume' (needed for the VWAP line).
@@ -104,6 +106,24 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
     compact: True for small multi-pane grid cells (Sectors tab) -- hides
         the legend, tightens margins, and shrinks label/annotation fonts
         so the chart stays readable at a fraction of full size.
+    y_range: optional (min, max) tuple to PIN the y-axis to a fixed price
+        range -- needed to make two side-by-side panels for the same
+        stock (e.g. 18-day composite + today) share an identical vertical
+        scale, so the same price level lines up at the same height in
+        both charts for direct visual comparison.
+    market_hours_breaks: True to hide non-trading hours (overnight and
+        weekend gaps) on the x-axis -- needed when df spans multiple
+        calendar days at intraday (e.g. 5-min) granularity, since without
+        this a continuous time axis shows huge flat gaps for every night
+        and weekend, squeezing the actual trading data into thin slivers.
+        Leave False for single-session charts (today's candles, Replay),
+        where there's no multi-day gap to hide anyway.
+    event_markers: optional list of {"time": datetime, "label": str,
+        "color": optional hex str} dicts -- draws a vertical dotted line
+        spanning the full chart height at each event's time, with a short
+        label at the top. Ties Setups-tab alerts (a resistance breakdown,
+        a support reclaim, a confirmation loss) to the exact candle where
+        they fired, instead of leaving them only in a separate table.
     """
     fig = go.Figure()
 
@@ -161,9 +181,9 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
     min_gap = price_span * 0.04
     placed_y = []
 
-    label_font_size = 9 if compact else 11
-    line_width_base = 1.0 if compact else 1.5
-    line_width_validated = 1.8 if compact else 2.5
+    label_font_size = 11 if compact else 13
+    line_width_base = 1.5 if compact else 1.8
+    line_width_validated = 2.2 if compact else 2.8
 
     # Zones to draw = composite_zones UNION validated_zones, deduplicated
     # by price_mode. Drawing from composite_zones alone would miss cases
@@ -237,35 +257,64 @@ def plot_candles_with_zones(df, composite_zones=None, intraday_zones=None,
     if not compact:
         fig.add_annotation(
             x=x0, y=last_close, text=f"LTP {last_close:.0f}",
-            showarrow=False, xanchor="right", font=dict(size=10, color=LTP_LINE),
+            showarrow=False, xanchor="right", font=dict(size=12, color=LTP_LINE),
             bgcolor="rgba(19, 23, 34, 0.9)",
         )
     else:
         fig.add_annotation(
             x=x0, y=last_close, text=f"{last_close:.0f}",
-            showarrow=False, xanchor="right", font=dict(size=9, color=LTP_LINE),
+            showarrow=False, xanchor="right", font=dict(size=11, color=LTP_LINE),
             bgcolor="rgba(19, 23, 34, 0.85)",
         )
 
+    yaxis_config = dict(
+        title="Price" if not compact else None,
+        gridcolor=GRID_COLOR, gridwidth=1, showgrid=True,
+        color=TEXT_COLOR, linecolor=GRID_COLOR, linewidth=1.5,
+        tickfont=dict(size=13 if compact else 14),
+    )
+    if y_range is not None:
+        yaxis_config["range"] = list(y_range)
+
+    for ev in (event_markers or []):
+        marker_color = ev.get("color", "#FFD54F")  # amber, distinct from support/resistance/VWAP/LTP
+        fig.add_shape(
+            type="line", xref="x", yref="paper",
+            x0=ev["time"], x1=ev["time"], y0=0, y1=1,
+            line=dict(color=marker_color, width=1.2, dash="dot"),
+        )
+        fig.add_annotation(
+            x=ev["time"], y=1.0, yref="paper", yanchor="bottom",
+            text=ev.get("label", ""), showarrow=False, textangle=-90 if compact else 0,
+            font=dict(size=9 if compact else 10, color=marker_color),
+            bgcolor="rgba(19, 23, 34, 0.85)",
+        )
+
+    xaxis_config = dict(
+        title=None, gridcolor=GRID_COLOR, gridwidth=1, showgrid=True,
+        rangeslider_visible=False, color=TEXT_COLOR, linecolor=GRID_COLOR, linewidth=1.5,
+        range=[x0, x1],
+        tickformat=tick_format or "%H:%M",
+        tickfont=dict(size=12 if compact else 13),
+    )
+    if market_hours_breaks:
+        # Hides 15:30 -> next day's 09:15 (overnight) and Sat/Mon (weekend)
+        # so a multi-day intraday series stays visually compact instead of
+        # mostly-blank-space with tiny clusters of real candles.
+        xaxis_config["rangebreaks"] = [
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[15.5, 9.25], pattern="hour"),
+        ]
+
     fig.update_layout(
-        title=dict(text=title, font=dict(color=TEXT_COLOR, size=16 if not compact else 12), y=0.98),
+        title=dict(text=title, font=dict(color=TEXT_COLOR, size=16 if not compact else 13), y=0.98),
         paper_bgcolor=BG_COLOR,
         plot_bgcolor=BG_COLOR,
         font=dict(color=TEXT_COLOR),
-        xaxis=dict(
-            title=None, gridcolor=GRID_COLOR, showgrid=True,
-            rangeslider_visible=False, color=TEXT_COLOR,
-            range=[x0, x1],
-            tickformat="%H:%M",
-            showticklabels=not compact,
-        ),
-        yaxis=dict(
-            title="Price" if not compact else None,
-            gridcolor=GRID_COLOR, showgrid=True, color=TEXT_COLOR,
-            tickfont=dict(size=9) if compact else {},
-        ),
+        xaxis=xaxis_config,
+        yaxis=yaxis_config,
         height=height,
-        margin=(dict(l=30, r=45, t=30, b=15) if compact
+        margin=(dict(l=45, r=55, t=35, b=25) if compact
                 else dict(l=55, r=90, t=70, b=30)),
         showlegend=not compact,
         legend=dict(

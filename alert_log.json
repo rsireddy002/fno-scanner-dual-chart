@@ -1,10 +1,47 @@
 {
-  "alerts": [],
+  "alerts": [
+    {
+      "symbol": "KEI",
+      "signal": "SELL",
+      "ltp": 4850.0,
+      "vwap": 4925.32,
+      "rvol_pct": 508.0,
+      "time": "2026-09-06 14:43:02",
+      "is_latest": true
+    },
+    {
+      "symbol": "ANGELONE",
+      "signal": "SELL",
+      "ltp": 299.8,
+      "vwap": 301.46,
+      "rvol_pct": 448.0,
+      "time": "2026-09-06 14:43:02",
+      "is_latest": true
+    },
+    {
+      "symbol": "TITAGARH",
+      "signal": "SELL",
+      "ltp": 871.85,
+      "vwap": 880.4,
+      "rvol_pct": 577.9,
+      "time": "2026-09-06 14:43:02",
+      "is_latest": true
+    },
+    {
+      "symbol": "POLYCAB",
+      "signal": "SELL",
+      "ltp": 8300.0,
+      "vwap": 8351.05,
+      "rvol_pct": 430.1,
+      "time": "2026-09-06 14:43:02",
+      "is_latest": true
+    }
+  ],
   "last_eligible_symbols": [
-    "KEI",
     "ANGELONE",
     "TITAGARH",
-    "GICRE",
-    "POLYCAB"
+    "POLYCAB",
+    "KEI",
+    "GICRE"
   ]
 }

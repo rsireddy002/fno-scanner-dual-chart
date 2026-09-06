@@ -549,6 +549,7 @@ def run_precompute(token, progress_callback=None):
                 "intraday_zones": intraday_zones,
                 "last_signal": "-",
                 "zones_updated_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                "today_events": [],  # reset each day at Precompute -- see run_live_scan
             }
         except Exception as e:
             st.warning(f"{symbol}: precompute failed ({e}), skipping.")
@@ -800,6 +801,15 @@ def run_live_scan(cache, token):
                     "next_level": next_support["price_mode"] if next_support is not None else None,
                     "next_pct": round(next_support_dist, 2) if next_support_dist is not None else None,
                 })
+                # record with a timestamp so the Chart tab can mark the
+                # exact candle this fired on, tying the Setups-tab table
+                # to a specific point on the chart instead of leaving it
+                # only as a row in a separate table.
+                cache[symbol].setdefault("today_events", []).append({
+                    "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                    "label": f"Broke below {z['price_mode']:.0f}",
+                    "color": "#EF5350",
+                })
 
             for z in level_reclaims:
                 # after breaking up through this level, the nearest zone
@@ -812,6 +822,11 @@ def run_live_scan(cache, token):
                     "zone_pct": _pct_from_label_safe(z["label"]),
                     "next_level": next_resistance["price_mode"] if next_resistance is not None else None,
                     "next_pct": round(next_resistance_dist, 2) if next_resistance_dist is not None else None,
+                })
+                cache[symbol].setdefault("today_events", []).append({
+                    "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                    "label": f"Broke above {z['price_mode']:.0f}",
+                    "color": "#26A69A",
                 })
 
         rows.append({
@@ -940,6 +955,130 @@ def build_zones_display_df(zones):
     return df.sort_values("Level", ascending=False).reset_index(drop=True)
 
 
+def shared_y_range(dfs, zone_lists):
+    """Union of price extents across multiple panels' candle data AND
+    their zones, so a horizontal support/resistance line lines up at the
+    same height across panels sharing this range -- e.g. the 18-day
+    composite panel and today's developing panel for the same stock --
+    for direct visual comparison instead of two independently-scaled
+    charts."""
+    lows, highs = [], []
+    for df in dfs:
+        if df is not None and not df.empty:
+            lows.append(df["low"].min())
+            highs.append(df["high"].max())
+    for zones in zone_lists:
+        for z in zones or []:
+            lows.append(z["price_low"])
+            highs.append(z["price_high"])
+    if not lows or not highs:
+        return None
+    lo, hi = min(lows), max(highs)
+    pad = (hi - lo) * 0.05 if hi > lo else 1
+    return (lo - pad, hi + pad)
+
+
+def build_screener_df(cache, price_lookup):
+    """Ranks EVERY symbol by distance to its single nearest validated
+    zone (support or resistance, whichever is closer), ascending -- the
+    stocks genuinely at a decision point right now float to the top,
+    instead of having to scroll sector by sector hoping to spot one."""
+    rows = []
+    for symbol, c in cache.items():
+        ltp = price_lookup.get(symbol)
+        if ltp is None:
+            continue
+        val_comp, _, _ = cross_validated_zones(
+            c.get("composite_zones", []), c.get("intraday_zones", [])
+        )
+        support, support_dist, resistance, resistance_dist = nearest_zones(ltp, val_comp)
+
+        # pick whichever side is actually closer
+        if support_dist is not None and (resistance_dist is None or support_dist <= resistance_dist):
+            nearest, dist, kind = support, support_dist, "Support"
+        elif resistance_dist is not None:
+            nearest, dist, kind = resistance, resistance_dist, "Resistance"
+        else:
+            continue  # no validated zone on either side at all
+
+        rows.append({
+            "Symbol": symbol, "Sector": SECTOR_MAP.get(symbol, "-"),
+            "LTP": ltp, "Nearest level": nearest["price_mode"],
+            "Kind": kind, "Distance %": round(dist, 2),
+            "Zone %": _pct_from_label_safe(nearest["label"]),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("Distance %").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_composite_history_cached(instrument_key, token, days):
+    """Cached for an hour -- this is the SAME 5-min data
+    compute_composite_zones() used to build the composite zones in
+    run_precompute, so re-fetching it constantly on every grid re-render
+    (every auto-refresh tick, every tab switch) would be wasteful for
+    data that only actually changes once a day at the next Precompute."""
+    return fetch_candles(instrument_key, token, "minutes", "5", days)
+
+
+def render_symbol_grid(cache, symbols_list, token, key_prefix="sector"):
+    # One stock per row, two panels: 18-day composite (left, at 5-min
+    # resolution -- the same data the zones were built from) and today's
+    # developing session (right) -- stack stocks vertically so scrolling
+    # moves through the whole sector. Used by both the Sectors tab and
+    # the Support/Resistance Screener tabs (jump-to-sector view).
+    for sym in symbols_list:
+        c = cache[sym]
+        st.markdown(f"**{sym}**")
+        col_left, col_right = st.columns(2)
+
+        val_comp, _, _ = cross_validated_zones(
+            c.get("composite_zones", []), c.get("intraday_zones", [])
+        )
+
+        composite_df = fetch_composite_history_cached(
+            c["instrument_key"], token, COMPOSITE_LOOKBACK_DAYS
+        )
+        grid_df = get_today_candles(sym, c["instrument_key"], token)
+
+        with col_left:
+            if composite_df.empty:
+                st.write("No history available.")
+            else:
+                fig_left = plot_candles_with_zones(
+                    composite_df,
+                    composite_zones=c.get("composite_zones", []),
+                    intraday_zones=[],
+                    validated_zones=val_comp,
+                    title=f"{sym} - 18 days (5-min)",
+                    height=220, compact=True,
+                    show_vwap=False, tick_format="%d %b",
+                    market_hours_breaks=True,
+                )
+                st.plotly_chart(fig_left, use_container_width=True,
+                                 key=f"{key_prefix}_composite_{sym}")
+
+        with col_right:
+            if grid_df.empty:
+                st.write("No candle data yet for today.")
+            else:
+                fig_right = plot_candles_with_zones(
+                    grid_df,
+                    composite_zones=[],  # avoid clutter in the compact grid cell
+                    intraday_zones=[],
+                    validated_zones=val_comp,
+                    title=f"{sym} - today",
+                    height=220, compact=True,
+                )
+                st.plotly_chart(fig_right, use_container_width=True,
+                                 key=f"{key_prefix}_today_{sym}")
+
+        st.divider()
+
+
 # ---------------- UI (four tabs: Scanner, Key Levels, Chart, Alerts) ----------------
 st.set_page_config(page_title="Sahi Key Levels LIVE", layout="wide")
 st.title("Sahi Key Levels LIVE")
@@ -1042,9 +1181,60 @@ if os.path.exists(CACHE_PATH):
 
     st.divider()
 
-    tab_scanner, tab_levels, tab_chart, tab_sectors, tab_setups, tab_replay, tab_alerts = st.tabs(
-        ["Scanner", "Key Levels", "Chart", "Sectors", "Setups", "Replay", "Alerts"]
+    tab_scanner, tab_support_screener, tab_resistance_screener, tab_levels, tab_chart, tab_sectors, tab_setups, tab_replay, tab_alerts = st.tabs(
+        ["Scanner", "Support Screener", "Resistance Screener", "Key Levels", "Chart", "Sectors", "Setups", "Replay", "Alerts"]
     )
+
+    def render_screener_tab(kind_label):
+        """kind_label: 'Support' or 'Resistance' -- filters build_screener_df's
+        ranked list to just that side, then lets you pick a stock from it to
+        see its ENTIRE sector rendered right here (same dual-chart view as
+        the Sectors tab). Streamlit has no way to programmatically jump to a
+        different tab, so this is the equivalent: pick a stock, see its
+        sector peers immediately, without leaving this tab."""
+        st.caption(
+            f"Symbols ranked by how close they are to a validated {kind_label.lower()} "
+            f"level -- closest (most actionable) first."
+        )
+        full_df = build_screener_df(cache, price_lookup)
+        screener_df = full_df[full_df["Kind"] == kind_label].reset_index(drop=True) if not full_df.empty else full_df
+
+        if screener_df.empty:
+            st.write(f"No validated {kind_label.lower()} zones with a live price yet - "
+                     f"click 'Refresh Quotes'.")
+            return
+
+        n_show = st.slider(
+            "Show top N", min_value=10, max_value=len(screener_df),
+            value=min(30, len(screener_df)), key=f"screener_n_{kind_label}",
+        )
+        shown_df = screener_df.head(n_show)
+        st.dataframe(shown_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("**See this stock's sector**")
+        symbol_to_sector = dict(zip(shown_df["Symbol"], shown_df["Sector"]))
+        pick_symbol = st.selectbox(
+            "Pick a stock from the table above to see its whole sector "
+            "(all peer stocks, same dual-chart view as the Sectors tab)",
+            shown_df["Symbol"].tolist(), key=f"screener_pick_{kind_label}",
+            format_func=lambda sym: f"{sym} — {symbol_to_sector.get(sym, '-')}",
+        )
+        if pick_symbol:
+            pick_sector = SECTOR_MAP.get(pick_symbol)
+            if pick_sector is None:
+                st.write(f"{pick_symbol} isn't mapped to a sector.")
+            else:
+                sector_peers = [s for s in symbols_with_zones if SECTOR_MAP.get(s) == pick_sector]
+                st.markdown(f"### {pick_sector} (via {pick_symbol})")
+                token = get_token()
+                render_symbol_grid(cache, sector_peers, token, key_prefix=f"screener_{kind_label}")
+
+    with tab_support_screener:
+        render_screener_tab("Support")
+
+    with tab_resistance_screener:
+        render_screener_tab("Resistance")
 
     with tab_scanner:
         st.caption(f"Last refreshed: {st.session_state.get('last_refresh_time', 'never')}")
@@ -1093,27 +1283,87 @@ if os.path.exists(CACHE_PATH):
             c = cache[chart_symbol]
             token = get_token()
 
+            val_comp, val_intra, _ = cross_validated_zones(
+                c.get("composite_zones", []), c.get("intraday_zones", [])
+            )
+
+            # 5-min candles over the composite lookback window -- the SAME
+            # data compute_composite_zones() was built from in run_precompute,
+            # so the candles shown here match exactly what produced these
+            # zones, at real intraday resolution instead of one blunt daily
+            # bar per day.
+            composite_hist_df = fetch_candles(
+                c["instrument_key"], token, "minutes", "5", COMPOSITE_LOOKBACK_DAYS
+            )
             chart_df = get_today_candles(chart_symbol, c["instrument_key"], token)
 
-            if chart_df.empty:
-                st.write("No candle data yet for today.")
-            else:
-                val_comp, val_intra, _ = cross_validated_zones(
-                    c.get("composite_zones", []), c.get("intraday_zones", [])
-                )
-                fig = plot_candles_with_zones(
-                    chart_df,
-                    composite_zones=c.get("composite_zones", []),
-                    intraday_zones=c.get("intraday_zones", []),
-                    validated_zones=val_comp,
-                    title=f"{chart_symbol} - price with key levels",
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                st.markdown(f"**Previous {COMPOSITE_LOOKBACK_DAYS} days (composite, 5-min)**")
+                if composite_hist_df.empty:
+                    st.write("No history available.")
+                else:
+                    fig_left = plot_candles_with_zones(
+                        composite_hist_df,
+                        composite_zones=c.get("composite_zones", []),
+                        intraday_zones=[],
+                        validated_zones=val_comp,
+                        title=f"{chart_symbol} - last {COMPOSITE_LOOKBACK_DAYS} days (5-min)",
+                        show_vwap=False,  # a single cumulative VWAP across 18 days isn't meaningful
+                        tick_format="%d %b",
+                        market_hours_breaks=True,
+                    )
+                    st.plotly_chart(fig_left, use_container_width=True, key="chart_composite_left")
+
+            with col_right:
+                st.markdown("**Today (developing)**")
+                if chart_df.empty:
+                    st.write("No candle data yet for today.")
+                else:
+                    # Turn today's recorded level-break events into chart
+                    # markers -- only ones that fall within the currently
+                    # plotted session (today_events accumulates across the
+                    # whole day; a stale event from before market open on
+                    # a prior run shouldn't show if it's somehow outside
+                    # the visible candle range).
+                    session_start = chart_df["timestamp"].iloc[0]
+                    session_end = chart_df["timestamp"].iloc[-1]
+                    chart_events = []
+                    for ev in c.get("today_events", []):
+                        try:
+                            ev_time = pd.Timestamp(ev["time"])
+                            # match tz-awareness to whatever chart_df's
+                            # timestamps actually are, rather than assuming --
+                            # Upstox's raw timestamp format can come back
+                            # either way depending on parse path.
+                            if session_start.tzinfo is not None and ev_time.tzinfo is None:
+                                ev_time = ev_time.tz_localize(IST)
+                            elif session_start.tzinfo is None and ev_time.tzinfo is not None:
+                                ev_time = ev_time.tz_localize(None)
+                        except Exception:
+                            continue
+                        if session_start <= ev_time <= session_end:
+                            chart_events.append({
+                                "time": ev_time, "label": ev["label"], "color": ev.get("color"),
+                            })
+
+                    fig_right = plot_candles_with_zones(
+                        chart_df,
+                        composite_zones=c.get("composite_zones", []),
+                        intraday_zones=c.get("intraday_zones", []),
+                        validated_zones=val_comp,
+                        title=f"{chart_symbol} - price with key levels",
+                        event_markers=chart_events,
+                    )
+                    st.plotly_chart(fig_right, use_container_width=True, key="chart_today_right")
 
     with tab_sectors:
         st.caption(
             "Scan by sector to see who's sitting at support, who's stuck at resistance, "
-            "and who's in open air."
+            "and who's in open air. Each stock shows two panels: the last 18 days on the "
+            "left, today's developing session on the right -- scroll down to move through "
+            "every stock in the sector."
         )
         available_sectors = sorted(set(
             SECTOR_MAP[s] for s in symbols_with_zones if s in SECTOR_MAP
@@ -1126,32 +1376,6 @@ if os.path.exists(CACHE_PATH):
                 horizontal=True, key="sector_view_mode",
             )
 
-            def render_symbol_grid(symbols_list, token):
-                # 2 charts per row, same as a small multi-pane terminal layout
-                for i in range(0, len(symbols_list), 2):
-                    row_symbols = symbols_list[i:i + 2]
-                    cols = st.columns(len(row_symbols))
-                    for col, sym in zip(cols, row_symbols):
-                        with col:
-                            c = cache[sym]
-                            grid_df = get_today_candles(sym, c["instrument_key"], token)
-                            if grid_df.empty:
-                                st.write(f"{sym}: no candle data yet.")
-                                continue
-                            val_comp, _, _ = cross_validated_zones(
-                                c.get("composite_zones", []), c.get("intraday_zones", [])
-                            )
-                            fig = plot_candles_with_zones(
-                                grid_df,
-                                composite_zones=[],   # hide faint reference lines in grid view -- too busy at small size
-                                intraday_zones=[],
-                                validated_zones=val_comp,
-                                title=sym,
-                                height=260,
-                                compact=True,
-                            )
-                            st.plotly_chart(fig, use_container_width=True, key=f"sector_chart_{sym}")
-
             if view_mode == "One sector at a time":
                 selected_sector = st.selectbox("Sector", available_sectors, key="sector_select")
                 sector_symbols = [s for s in symbols_with_zones if SECTOR_MAP.get(s) == selected_sector]
@@ -1160,7 +1384,7 @@ if os.path.exists(CACHE_PATH):
                     st.write("No symbols with zones in this sector yet.")
                 else:
                     token = get_token()
-                    render_symbol_grid(sector_symbols, token)
+                    render_symbol_grid(cache, sector_symbols, token)
 
             else:
                 total_symbols = len([s for s in symbols_with_zones if s in SECTOR_MAP])
@@ -1181,7 +1405,7 @@ if os.path.exists(CACHE_PATH):
                         if not sector_symbols:
                             continue
                         st.markdown(f"## {sector}")
-                        render_symbol_grid(sector_symbols, token)
+                        render_symbol_grid(cache, sector_symbols, token)
                         st.divider()
 
     with tab_setups:
