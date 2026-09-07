@@ -978,6 +978,26 @@ def shared_y_range(dfs, zone_lists):
     return (lo - pad, hi + pad)
 
 
+def get_session_x_range(df):
+    """Pins the x-axis to the FULL known session hours (09:15-15:30 IST)
+    for today's date, regardless of how many candles have actually formed
+    so far. Without this, early in the session -- right after market
+    open, when only a handful of 5-min candles exist -- Plotly's
+    autorange fits tightly to just those few candles, stretching them to
+    fill the entire chart width (the exact same issue already fixed for
+    the Replay tab, just showing up here at market open instead)."""
+    if df is None or df.empty:
+        return None
+    session_date = df["timestamp"].iloc[0].date()
+    start = datetime.combine(session_date, MARKET_OPEN_TIME)
+    end = datetime.combine(session_date, MARKET_CLOSE_TIME)
+    # match tz-awareness to whatever df's timestamps actually are
+    if df["timestamp"].iloc[0].tzinfo is not None:
+        start = start.replace(tzinfo=IST)
+        end = end.replace(tzinfo=IST)
+    return (start, end)
+
+
 def build_screener_df(cache, price_lookup):
     """Ranks EVERY symbol by distance to its single nearest validated
     zone (support or resistance, whichever is closer), ascending -- the
@@ -1072,6 +1092,7 @@ def render_symbol_grid(cache, symbols_list, token, key_prefix="sector"):
                     validated_zones=val_comp,
                     title=f"{sym} - today",
                     height=220, compact=True,
+                    x_range=get_session_x_range(grid_df),
                 )
                 st.plotly_chart(fig_right, use_container_width=True,
                                  key=f"{key_prefix}_today_{sym}")
@@ -1355,6 +1376,7 @@ if os.path.exists(CACHE_PATH):
                         validated_zones=val_comp,
                         title=f"{chart_symbol} - price with key levels",
                         event_markers=chart_events,
+                        x_range=get_session_x_range(chart_df),
                     )
                     st.plotly_chart(fig_right, use_container_width=True, key="chart_today_right")
 
